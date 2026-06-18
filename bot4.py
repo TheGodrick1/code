@@ -1,13 +1,11 @@
 
 import asyncio
 import logging
-import os
 import re
 import requests
 import pandas as pd
 from io import StringIO
 
-from dotenv import load_dotenv
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import Command
 from aiogram.types import Message, CallbackQuery
@@ -20,16 +18,9 @@ from aiogram.fsm.storage.memory import MemoryStorage
 # =========================
 # CONFIG
 # =========================
-load_dotenv()
-
-TOKEN = os.getenv("BOT_TOKEN")
-SHEET_ID = os.getenv("SHEET_ID")
-GID = os.getenv("GID", "0")
-
-if not TOKEN:
-    raise RuntimeError("BOT_TOKEN is not set. Copy .env.example to .env and fill in values.")
-if not SHEET_ID:
-    raise RuntimeError("SHEET_ID is not set. Copy .env.example to .env and fill in values.")
+TOKEN = "8646999046:AAGRE2uf6eRFttwQLOE-CJm1n1tefBQo9G8"
+SHEET_ID = "1pl0PFC1jJ-75NUjiePCFvZuae8qpUQ4cBYxAfsi0ULQ"
+GID = "0"
 
 MAX_MESSAGE_LENGTH = 4096
 OPTIONS_PAGE_SIZE = 10
