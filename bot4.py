@@ -1,9 +1,13 @@
 
 import asyncio
+import logging
+import os
+import re
 import requests
 import pandas as pd
 from io import StringIO
 
+from dotenv import load_dotenv
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import Command
 from aiogram.types import Message, CallbackQuery
@@ -16,14 +20,50 @@ from aiogram.fsm.storage.memory import MemoryStorage
 # =========================
 # CONFIG
 # =========================
-TOKEN = "8646999046:AAGRE2uf6eRFttwQLOE-CJm1n1tefBQo9G8"
+load_dotenv()
 
-SHEET_ID = "1pl0PFC1jJ-75NUjiePCFvZuae8qpUQ4cBYxAfsi0ULQ"
-GID = "0"
+TOKEN = os.getenv("BOT_TOKEN")
+SHEET_ID = os.getenv("SHEET_ID")
+GID = os.getenv("GID", "0")
 
+if not TOKEN:
+    raise RuntimeError("BOT_TOKEN is not set. Copy .env.example to .env and fill in values.")
+if not SHEET_ID:
+    raise RuntimeError("SHEET_ID is not set. Copy .env.example to .env and fill in values.")
+
+MAX_MESSAGE_LENGTH = 4096
+OPTIONS_PAGE_SIZE = 10
+
+PROMPTS = {
+    "group": "👥 Оберіть групу:",
+    "teacher": "👨‍🏫 Оберіть викладача:",
+    "room": "🏫 Оберіть аудиторію:",
+}
+
+DAY_MAP = {
+    "Понеділок": "ПОНЕДІЛОК",
+    "Вівторок": "ВІВТОРОК",
+    "Середа": "СЕРЕДА",
+    "Четвер": "ЧЕТВЕР",
+    "П'ятниця": "П'ЯТНИЦЯ",
+    "Субота": "СУБОТА",
+}
+SHEET_DAYS = set(DAY_MAP.values())
+
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    datefmt="%Y-%m-%d %H:%M:%S",
+)
+logger = logging.getLogger(__name__)
 
 bot = Bot(token=TOKEN)
 dp = Dispatcher(storage=MemoryStorage())
+
+
+def _user_info(user) -> str:
+    return f"user_id={user.id} username={user.username or '—'}"
 
 
 # =========================
@@ -38,11 +78,206 @@ class ScheduleFlow(StatesGroup):
 # =========================
 # GOOGLE SHEETS
 # =========================
-def load_schedule():
+def _cell(row, idx: int) -> str:
+    if idx >= len(row):
+        return ""
+    val = row.iloc[idx]
+    return "" if pd.isna(val) else str(val).strip()
+
+
+def _split_parts(text: str) -> list[str]:
+    return [part.strip() for part in text.split(";") if part.strip()]
+
+
+def _room_sort_key(room: str):
+    match = re.search(r"\d+", room)
+    if match:
+        return (0, int(match.group()), room.casefold())
+    return (1, room.casefold())
+
+
+def parse_schedule_entries(df):
+    groups = {}
+    entries = []
+    current_day = None
+
+    for _, row in df.iterrows():
+        first = _cell(row, 0)
+
+        if first == "Час":
+            groups = {
+                i: _cell(row, i)
+                for i in range(1, len(row))
+                if _cell(row, i)
+            }
+            continue
+
+        if first in SHEET_DAYS:
+            current_day = first
+            continue
+
+        if not current_day or not first[:1].isdigit():
+            continue
+
+        pair, _, time_part = first.partition(")")
+        pair = f"{pair})" if pair else first
+        time = time_part.strip()
+
+        for col_idx, group in groups.items():
+            subject = _cell(row, col_idx)
+            if not subject:
+                continue
+            entries.append({
+                "day": current_day,
+                "group": group,
+                "pair": pair,
+                "time": time,
+                "subject": subject,
+                "teacher": _cell(row, col_idx + 1),
+                "room": _cell(row, col_idx + 2),
+            })
+
+    return entries
+
+
+def split_message(text: str, limit: int = MAX_MESSAGE_LENGTH) -> list[str]:
+    if len(text) <= limit:
+        return [text]
+
+    chunks = []
+    while text:
+        if len(text) <= limit:
+            chunks.append(text)
+            break
+
+        split_at = text.rfind("\n\n", 0, limit)
+        if split_at <= 0:
+            split_at = text.rfind("\n", 0, limit)
+        if split_at <= 0:
+            split_at = limit
+
+        chunks.append(text[:split_at].rstrip())
+        text = text[split_at:].lstrip("\n")
+
+    return chunks
+
+
+def format_schedule_text(value, day, entries) -> str:
+    if not entries:
+        return f"📭 {day}\nНемає занять"
+
+    text = f"📅 {value} — {day}\n\n"
+    for entry in entries:
+        text += f"⏰ {entry['pair']} {entry['time']}\n"
+        if entry.get("subject"):
+            text += f"📚 {entry['subject']}\n"
+        group = entry.get("group", "")
+        teacher = entry.get("teacher", "")
+        room = entry.get("room", "")
+        if group:
+            text += f"👥 {group} | 👨‍🏫 {teacher} | 🏫 {room}\n\n"
+        else:
+            text += f"👨‍🏫 {teacher} | 🏫 {room}\n\n"
+
+    return text.rstrip()
+
+
+def _fetch_schedule_csv():
     url = f"https://docs.google.com/spreadsheets/d/{SHEET_ID}/export?format=csv&gid={GID}"
     r = requests.get(url)
     r.encoding = "utf-8"
     return pd.read_csv(StringIO(r.text))
+
+
+def _build_groups(df):
+    if "Группа" in df.columns:
+        return sorted(df["Группа"].dropna().astype(str).unique(), key=str.casefold)
+
+    seen = set()
+    groups = []
+    for _, row in df.iterrows():
+        if _cell(row, 0) != "Час":
+            continue
+        for i in range(1, len(row)):
+            group = _cell(row, i)
+            if group and group not in seen:
+                seen.add(group)
+                groups.append(group)
+
+    return sorted(groups, key=str.casefold)
+
+
+def _build_teachers(df, entries):
+    if "Препод" in df.columns:
+        teachers = {
+            str(t).strip()
+            for t in df["Препод"].dropna()
+            if str(t).strip() and str(t).strip() != "-"
+        }
+        return sorted(teachers, key=str.casefold)
+
+    teachers = set()
+    for entry in entries:
+        for teacher in _split_parts(entry["teacher"]):
+            if teacher != "-":
+                teachers.add(teacher)
+
+    return sorted(teachers, key=str.casefold)
+
+
+def _build_rooms(df, entries):
+    if "Аудитория" in df.columns:
+        rooms = {
+            str(r).strip()
+            for r in df["Аудитория"].dropna()
+            if str(r).strip() and str(r).strip() != "-"
+        }
+        return sorted(rooms, key=_room_sort_key)
+
+    rooms = set()
+    for entry in entries:
+        for room in _split_parts(entry["room"]):
+            if room != "-":
+                rooms.add(room)
+
+    return sorted(rooms, key=_room_sort_key)
+
+
+_schedule_df = None
+_schedule_entries = []
+_groups = []
+_teachers = []
+_rooms = []
+
+
+def init_schedule_data():
+    global _schedule_df, _schedule_entries, _groups, _teachers, _rooms
+
+    logger.info("Завантаження розкладу з Google Sheets...")
+    _schedule_df = _fetch_schedule_csv()
+    _schedule_entries = parse_schedule_entries(_schedule_df)
+    _groups = _build_groups(_schedule_df)
+    _teachers = _build_teachers(_schedule_df, _schedule_entries)
+    _rooms = _build_rooms(_schedule_df, _schedule_entries)
+    logger.info(
+        "Розклад завантажено: %d занять, %d груп, %d викладачів, %d аудиторій",
+        len(_schedule_entries),
+        len(_groups),
+        len(_teachers),
+        len(_rooms),
+    )
+
+
+def get_groups():
+    return _groups
+
+
+def get_teachers():
+    return _teachers
+
+
+def get_rooms():
+    return _rooms
 
 
 # =========================
@@ -50,18 +285,18 @@ def load_schedule():
 # =========================
 def type_keyboard():
     return InlineKeyboardBuilder().row(
-        InlineKeyboardButton(text="👥 Группа", callback_data="type_group"),
-        InlineKeyboardButton(text="👨‍🏫 Преподаватель", callback_data="type_teacher"),
+        InlineKeyboardButton(text="👥 Група", callback_data="type_group"),
+        InlineKeyboardButton(text="👨‍🏫 Викладач", callback_data="type_teacher"),
     ).row(
-        InlineKeyboardButton(text="🏫 Аудитория", callback_data="type_room"),
+        InlineKeyboardButton(text="🏫 Аудиторія", callback_data="type_room"),
     ).as_markup()
 
 
 def days_keyboard():
     kb = InlineKeyboardBuilder()
     days = [
-        "Понедельник", "Вторник", "Среда",
-        "Четверг", "Пятница", "Суббота"
+        "Понеділок", "Вівторок", "Середа",
+        "Четвер", "П'ятниця", "Субота"
     ]
 
     for d in days:
@@ -71,14 +306,40 @@ def days_keyboard():
     return kb.as_markup()
 
 
+def options_keyboard(options, page=0):
+    total = len(options)
+    total_pages = max(1, (total + OPTIONS_PAGE_SIZE - 1) // OPTIONS_PAGE_SIZE)
+    page = max(0, min(page, total_pages - 1))
+    start = page * OPTIONS_PAGE_SIZE
+    end = min(start + OPTIONS_PAGE_SIZE, total)
+
+    kb = InlineKeyboardBuilder()
+    for i in range(start, end):
+        kb.button(text=options[i], callback_data=f"pick_{i}")
+    kb.adjust(2)
+
+    if total_pages > 1:
+        nav = []
+        if page > 0:
+            nav.append(InlineKeyboardButton(text="◀️", callback_data=f"page_{page - 1}"))
+        nav.append(InlineKeyboardButton(text=f"{page + 1}/{total_pages}", callback_data="page_nop"))
+        if page < total_pages - 1:
+            nav.append(InlineKeyboardButton(text="▶️", callback_data=f"page_{page + 1}"))
+        kb.row(*nav)
+
+    kb.row(InlineKeyboardButton(text="⬅️ Назад до розкладу", callback_data="back_schedule"))
+    return kb.as_markup()
+
+
 # =========================
 # START
 # =========================
 @dp.message(Command("start"))
 async def start(message: Message):
+    logger.info("Request: /start | %s", _user_info(message.from_user))
     await message.answer(
-        "🎓 Бот расписания\n\n"
-        "/schedule — открыть расписание"
+        "🎓 Бот розкладу\n\n"
+        "/schedule — відкрити розклад"
     )
 
 
@@ -87,8 +348,9 @@ async def start(message: Message):
 # =========================
 @dp.message(Command("schedule"))
 async def schedule(message: Message, state: FSMContext):
+    logger.info("Request: /schedule | %s", _user_info(message.from_user))
     await state.set_state(ScheduleFlow.choose_type)
-    await message.answer("📅 Выберите тип расписания:", reply_markup=type_keyboard())
+    await message.answer("📅 Оберіть тип розкладу:", reply_markup=type_keyboard())
 
 
 # =========================
@@ -97,54 +359,153 @@ async def schedule(message: Message, state: FSMContext):
 @dp.callback_query(F.data.startswith("type_"))
 async def choose_type(call: CallbackQuery, state: FSMContext):
     t = call.data.replace("type_", "")
+    logger.info(
+        "Request: type=%s | %s",
+        t,
+        _user_info(call.from_user),
+    )
 
     await state.update_data(type=t)
     await state.set_state(ScheduleFlow.choose_value)
 
     if t == "group":
-        await call.message.answer("Введите группу (например KI-21):")
+        options = get_groups()
+        empty_msg = "Групи не знайдено в розкладі."
     elif t == "teacher":
-        await call.message.answer("Введите фамилию преподавателя:")
+        options = get_teachers()
+        empty_msg = "Викладачів не знайдено в розкладі."
     else:
-        await call.message.answer("Введите номер аудитории:")
+        options = get_rooms()
+        empty_msg = "Аудиторії не знайдено в розкладі."
+
+    if options:
+        await state.update_data(options=options, options_page=0)
+        await call.message.answer(
+            PROMPTS[t],
+            reply_markup=options_keyboard(options, page=0),
+        )
+    else:
+        await call.message.answer(empty_msg)
 
     await call.answer()
 
 
-# =========================
-# VALUE INPUT
-# =========================
-@dp.message(ScheduleFlow.choose_value)
-async def get_value(message: Message, state: FSMContext):
-    await state.update_data(value=message.text)
-    await state.set_state(ScheduleFlow.choose_day)
+@dp.callback_query(F.data.startswith("page_"), ScheduleFlow.choose_value)
+async def paginate_options(call: CallbackQuery, state: FSMContext):
+    if call.data == "page_nop":
+        await call.answer()
+        return
 
-    await message.answer("📆 Выберите день:", reply_markup=days_keyboard())
+    try:
+        page = int(call.data.removeprefix("page_"))
+    except ValueError:
+        await call.answer()
+        return
+
+    data = await state.get_data()
+    options = data.get("options", [])
+    prompt = PROMPTS.get(data.get("type"), "Оберіть:")
+
+    await state.update_data(options_page=page)
+    await call.message.edit_text(prompt, reply_markup=options_keyboard(options, page=page))
+    await call.answer()
+
+
+@dp.callback_query(F.data == "back_schedule", ScheduleFlow.choose_value)
+async def back_to_schedule(call: CallbackQuery, state: FSMContext):
+    await state.set_state(ScheduleFlow.choose_type)
+    await call.message.edit_text("📅 Оберіть тип розкладу:", reply_markup=type_keyboard())
+    await call.answer()
+
+
+# =========================
+# VALUE SELECT
+# =========================
+@dp.callback_query(F.data.startswith("pick_"), ScheduleFlow.choose_value)
+async def choose_value(call: CallbackQuery, state: FSMContext):
+    try:
+        idx = int(call.data.removeprefix("pick_"))
+    except ValueError:
+        await call.answer()
+        return
+
+    data = await state.get_data()
+    options = data.get("options", [])
+    if idx < 0 or idx >= len(options):
+        await call.answer("Невірний вибір", show_alert=True)
+        return
+
+    value = options[idx]
+    logger.info(
+        "Request: type=%s value=%r | %s",
+        data.get("type"),
+        value,
+        _user_info(call.from_user),
+    )
+
+    await state.update_data(value=value)
+    await state.set_state(ScheduleFlow.choose_day)
+    await call.message.answer("📆 Оберіть день:", reply_markup=days_keyboard())
+    await call.answer()
 
 
 # =========================
 # FILTER LOGIC
 # =========================
-def filter_schedule(df, data):
+def filter_schedule(data):
     t = data["type"]
     value = data["value"]
     day = data["day"]
+    day_ua = DAY_MAP.get(day, day)
+    df = _schedule_df
 
-    if "День" in df.columns:
-        df = df[df["День"] == day]
-    elif day in df.columns:
-        df = df[df[day].notna()]
+    if "Группа" in df.columns or "День" in df.columns:
+        filtered = df.copy()
 
-    if t == "group" and "Группа" in df.columns:
-        df = df[df["Группа"].astype(str).str.contains(value, case=False, na=False)]
+        if "День" in filtered.columns:
+            filtered = filtered[filtered["День"] == day]
 
-    elif t == "teacher" and "Препод" in df.columns:
-        df = df[df["Препод"].astype(str).str.contains(value, case=False, na=False)]
+        if t == "group" and "Группа" in filtered.columns:
+            filtered = filtered[
+                filtered["Группа"].astype(str).str.contains(value, case=False, na=False)
+            ]
+        elif t == "teacher" and "Препод" in filtered.columns:
+            filtered = filtered[
+                filtered["Препод"].astype(str).str.contains(value, case=False, na=False)
+            ]
+        elif t == "room" and "Аудитория" in filtered.columns:
+            filtered = filtered[
+                filtered["Аудитория"].astype(str).str.contains(value, case=False, na=False)
+            ]
 
-    elif t == "room" and "Аудитория" in df.columns:
-        df = df[df["Аудитория"].astype(str).str.contains(value, case=False, na=False)]
+        return [
+            {
+                "pair": row.get("Пара", "—"),
+                "time": row.get("Время", ""),
+                "group": row.get("Группа", ""),
+                "subject": row.get("Предмет", ""),
+                "teacher": row.get("Препод", ""),
+                "room": row.get("Аудитория", ""),
+            }
+            for _, row in filtered.iterrows()
+        ]
 
-    return df
+    entries = [e for e in _schedule_entries if e["day"] == day_ua]
+
+    if t == "group":
+        entries = [e for e in entries if e["group"] == value]
+    elif t == "teacher":
+        entries = [
+            e for e in entries
+            if value.casefold() in {t.casefold() for t in _split_parts(e["teacher"])}
+        ]
+    elif t == "room":
+        entries = [
+            e for e in entries
+            if value.casefold() in {r.casefold() for r in _split_parts(e["room"])}
+        ]
+
+    return entries
 
 
 # =========================
@@ -157,25 +518,23 @@ async def show_schedule(call: CallbackQuery, state: FSMContext):
     data = await state.get_data()
     data["day"] = day
 
-    df = load_schedule()
-    result = filter_schedule(df, data)
+    result = filter_schedule(data)
 
-    if result.empty:
-        text = f"📭 {day}\nНет занятий"
-    else:
-        text = f"📅 {data['value']} — {day}\n\n"
+    logger.info(
+        "Request: type=%s value=%r day=%s results=%d | %s",
+        data.get("type"),
+        data.get("value"),
+        day,
+        len(result),
+        _user_info(call.from_user),
+    )
 
-        for _, row in result.iterrows():
-            pair = row.get("Пара", "—")
-            time = row.get("Время", "")
-            group = row.get("Группа", "")
-            teacher = row.get("Препод", "")
-            room = row.get("Аудитория", "")
+    text = format_schedule_text(data["value"], day, result)
+    chunks = split_message(text)
 
-            text += f"⏰ {pair} {time}\n"
-            text += f"👥 {group} | 👨‍🏫 {teacher} | 🏫 {room}\n\n"
-
-    await call.message.edit_text(text)
+    await call.message.edit_text(chunks[0])
+    for chunk in chunks[1:]:
+        await call.message.answer(chunk)
     await state.clear()
     await call.answer()
 
@@ -184,7 +543,8 @@ async def show_schedule(call: CallbackQuery, state: FSMContext):
 # RUN
 # =========================
 async def main():
-    print("Bot started...")
+    init_schedule_data()
+    logger.info("Бот запущено")
     await dp.start_polling(bot)
 
 
